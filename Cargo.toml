@@ -1,0 +1,11 @@
+[package]
+name = "image-effects-dnd"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+ab_glyph = "0.2.32"
+eframe = "0.33.3"
+egui_dnd = "0.14.0"
+image = "0.25.9"
+imageproc = "0.26.0"
