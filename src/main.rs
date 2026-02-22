@@ -1,6 +1,6 @@
 use std::f32::consts::PI;
 
-use ab_glyph::{Font, FontVec, PxScale, ScaleFont};
+use ab_glyph::{Font, FontVec, PxScale, PxScaleFont, ScaleFont};
 use eframe::egui;
 use egui_dnd::dnd;
 use image::{DynamicImage, Rgba, RgbaImage};
@@ -67,6 +67,28 @@ impl std::hash::Hash for ImageOp {
 }
 // END FIX 2
 
+
+fn calculate_line_width(scaled_font: PxScaleFont<&FontVec>, text: &str) -> f32 {
+    let mut width = 0.0;
+    let mut last_glyph_id = None;
+
+    for c in text.chars() {
+        let glyph_id = scaled_font.glyph_id(c);
+        
+        // 2. Kerning exists on the 'Font' trait (unscaled)
+        if let Some(last_id) = last_glyph_id {
+            // Important: Unscaled kern units must be multiplied by the scale factor
+            // or use the helper: scaled_font.kern(last_id, glyph_id)
+            width += scaled_font.kern(last_id, glyph_id);
+        }
+
+        // 3. Add the advance width (already scaled)
+        width += scaled_font.h_advance(glyph_id);
+        last_glyph_id = Some(glyph_id);
+    }
+    width
+}
+
 pub fn draw_multiline_text(
     image: &mut RgbaImage,
     color: Rgba<u8>,
@@ -76,23 +98,15 @@ pub fn draw_multiline_text(
     font: &FontVec,
     text: &str,
 ) {
-    // 1. Determine how tall each line should be.
-    // 'v_metrics' gives us the ascent, descent, and gap of the font.
-    let v_metrics = font.as_scaled(scale);
-
-    // Calculate line height: (ascent - descent) + gap
-    // We add a small buffer (e.g., + 2.0) for cleaner separation if needed.
-    let line_height =
-        (v_metrics.ascent() - v_metrics.descent() + v_metrics.line_gap()).ceil() as i32;
-
-    // 2. Loop through each line in the string
+    let scaled_font = font.as_scaled(scale);
+    let line_height = scaled_font.height();
+    
     for line in text.lines() {
         if !line.is_empty() {
-            draw_text_mut(image, color, x, y, scale, font, line);
+            let w = calculate_line_width(scaled_font,line);
+            draw_text_mut(image, color, x - ((w as i32)/2), y, scale, font, line);
         }
-
-        // 3. Move the cursor down for the next line
-        y += line_height;
+        y += line_height as i32;
     }
 }
 
@@ -125,7 +139,7 @@ fn image_watermark(
         imageproc::geometric_transformations::Interpolation::Bicubic,
         Rgba([0, 0, 0, 0]),
     );
-    image::imageops::overlay(image, &text_image, 0, 0);
+    // image::imageops::overlay(image, &text_image, 0, -100);
     image::imageops::overlay(image, &text_image, params.x as i64, params.y as i64);
     Ok(())
 }
@@ -245,6 +259,9 @@ impl eframe::App for MyApp {
 
             ui.separator();
 
+            let half_width = (self.original_image.width() / 2) as i32;
+            let half_height = (self.original_image.height() / 2) as i32;
+
             let response =
                 dnd(ui, "effect_dnd").show_vec(&mut self.pipeline, |ui, item, handle, _state| {
                     ui.horizontal(|ui| {
@@ -272,6 +289,9 @@ impl eframe::App for MyApp {
                                 }
                             }
                             EffectType::Watermark { params } => {
+                                // if ui.button("-").clicked(){
+                                //     self.pipeline.remove(0);
+                                // }
                                 ui.vertical(|ui| {
                                     ui.horizontal(|ui| {
                                         ui.label("Text");
@@ -299,7 +319,7 @@ impl eframe::App for MyApp {
                                         if ui
                                             .add(egui::Slider::new(
                                                 &mut params.x,
-                                                0..=self.original_image.width() as i32,
+                                                -half_width..=half_width,
                                             ))
                                             .changed()
                                         {
@@ -311,7 +331,7 @@ impl eframe::App for MyApp {
                                         if ui
                                             .add(egui::Slider::new(
                                                 &mut params.y,
-                                                0..=self.original_image.height() as i32,
+                                                -half_height..=half_height as i32,
                                             ))
                                             .changed()
                                         {
