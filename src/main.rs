@@ -4,7 +4,10 @@ use ab_glyph::{Font, FontVec, PxScale, PxScaleFont, ScaleFont};
 use eframe::egui;
 use egui_dnd::dnd;
 use image::{DynamicImage, Rgba, RgbaImage};
-use imageproc::drawing::draw_text_mut;
+use imageproc::{
+    drawing::{draw_filled_rect_mut, draw_text_mut},
+    rect::Rect,
+};
 
 fn main() -> eframe::Result<()> {
     let options = eframe::NativeOptions::default();
@@ -67,14 +70,13 @@ impl std::hash::Hash for ImageOp {
 }
 // END FIX 2
 
-
 fn calculate_line_width(scaled_font: PxScaleFont<&FontVec>, text: &str) -> f32 {
     let mut width = 0.0;
     let mut last_glyph_id = None;
 
     for c in text.chars() {
         let glyph_id = scaled_font.glyph_id(c);
-        
+
         // 2. Kerning exists on the 'Font' trait (unscaled)
         if let Some(last_id) = last_glyph_id {
             // Important: Unscaled kern units must be multiplied by the scale factor
@@ -89,25 +91,37 @@ fn calculate_line_width(scaled_font: PxScaleFont<&FontVec>, text: &str) -> f32 {
     width
 }
 
-pub fn draw_multiline_text(
+pub fn draw_multiline_text_mut(
     image: &mut RgbaImage,
     color: Rgba<u8>,
     x: i32,
-    mut y: i32,
+    y: i32,
     scale: PxScale,
     font: &FontVec,
     text: &str,
-) {
+) -> (f32, f32) {
     let scaled_font = font.as_scaled(scale);
     let line_height = scaled_font.height();
-    
+    let mut width = 0f32;
+    let mut height = 0f32;
+
     for line in text.lines() {
         if !line.is_empty() {
-            let w = calculate_line_width(scaled_font,line);
-            draw_text_mut(image, color, x - ((w as i32)/2), y, scale, font, line);
+            let w = calculate_line_width(scaled_font, line);
+            width = width.max(w);
+            draw_text_mut(
+                image,
+                color,
+                x - ((w as i32) / 2),
+                y + height as i32,
+                scale,
+                font,
+                line,
+            );
         }
-        y += line_height as i32;
+        height += line_height;
     }
+    (width, height)
 }
 
 fn image_watermark(
@@ -120,17 +134,22 @@ fn image_watermark(
     let font = FontVec::try_from_vec(font_vec)?;
     let mut text_image: image::ImageBuffer<Rgba<u8>, Vec<u8>> =
         image::ImageBuffer::new(image.width(), image.height());
-    // draw_text_mut(
-    draw_multiline_text(
+
+    let color = Rgba(params.color.to_array());
+    let x = (image.width() / 2) as i32;
+    let y = (image.height() / 2) as i32;
+
+    draw_filled_rect_mut(
         &mut text_image,
-        Rgba(params.color.to_array()),
-        (image.width() / 2).try_into()?,
-        // params.x as i32,
-        (image.height() / 2).try_into()?,
-        // params.y as i32,
-        scale,
-        &font,
-        &params.text,
+        Rect::at(0, y).of_size(image.width(), 2),
+        color,
+    );
+    let (_w, h) = draw_multiline_text_mut(&mut text_image, color, x, y, scale, &font, &params.text);
+
+    draw_filled_rect_mut(
+        &mut text_image,
+        Rect::at(0, y + h as i32).of_size(image.width(), 2),
+        color,
     );
     let theta = params.degree * (PI / 180.0);
     text_image = imageproc::geometric_transformations::rotate_about_center(
@@ -262,12 +281,18 @@ impl eframe::App for MyApp {
             let half_width = (self.original_image.width() / 2) as i32;
             let half_height = (self.original_image.height() / 2) as i32;
 
+            let mut remove_index: Option<usize> = None;
+
             let response =
-                dnd(ui, "effect_dnd").show_vec(&mut self.pipeline, |ui, item, handle, _state| {
+                dnd(ui, "effect_dnd").show_vec(&mut self.pipeline, |ui, item, handle, state| {
                     ui.horizontal(|ui| {
                         handle.ui(ui, |ui| {
                             ui.label("::");
                         });
+                        // if ui.button("❌").clicked() {
+                        //     // state.index gives us the current position of this item in the vector
+                        //     remove_index = Some(state.index);
+                        // }
 
                         match &mut item.effect {
                             EffectType::Blur { sigma } => {
@@ -289,12 +314,18 @@ impl eframe::App for MyApp {
                                 }
                             }
                             EffectType::Watermark { params } => {
-                                // if ui.button("-").clicked(){
-                                //     self.pipeline.remove(0);
+                                // if ui.button("-").clicked() {
+                                //     remove_index = Some(item.id);
                                 // }
                                 ui.vertical(|ui| {
                                     ui.horizontal(|ui| {
-                                        ui.label("Text");
+                                        ui.label("Color");
+                                        if ui.color_edit_button_srgba(&mut params.color).changed() {
+                                            self.dirty = true;
+                                        }
+                                    });
+                                    ui.horizontal(|ui| {
+                                        // ui.label("Text");
                                         if ui
                                             .add(egui::TextEdit::multiline(&mut params.text))
                                             .changed()
@@ -338,17 +369,23 @@ impl eframe::App for MyApp {
                                             self.dirty = true;
                                         }
                                     });
-                                    ui.horizontal(|ui| {
-                                        ui.label("Color");
-                                        if ui.color_edit_button_srgba(&mut params.color).changed() {
-                                            self.dirty = true;
-                                        }
-                                    });
                                 });
                             }
                         }
+
+                        // ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        //     if ui.button("❌").clicked() {
+                        //         // state.index gives us the current position of this item in the vector
+                        //         remove_index = Some(state.index);
+                        //     }
+                        // });
                     });
                 });
+
+            if let Some(idx) = remove_index {
+                self.pipeline.remove(idx);
+                self.dirty = true; // Tell the app to re-process the image
+            }
 
             if response.final_update().is_some() {
                 self.dirty = true;
