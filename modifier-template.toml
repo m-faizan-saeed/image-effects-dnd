@@ -1,0 +1,23 @@
+version = 1
+
+[[templates]]
+name = "Test"
+
+[[templates.modifiers]]
+type = "contrast"
+value = 0.10000000149011612
+
+[[templates.modifiers]]
+type = "brightness"
+value = 35
+
+[[templates.modifiers]]
+type = "watermark"
+text = """
+My Watermark
+Multiline"""
+color = "#000000FF"
+x = -182
+y = -197
+scale = 24.0
+degree = -45.0
