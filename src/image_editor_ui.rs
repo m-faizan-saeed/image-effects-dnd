@@ -4,19 +4,22 @@ use rfd::FileDialog;
 use serde::{Deserialize, Serialize};
 use std::{
     path::PathBuf,
-    sync::{mpsc, Arc},
+    sync::{Arc, mpsc},
     thread,
+    time::{Duration, Instant},
 };
 
 use crate::image_editor::{EffectType, ImageEditor, ImageOp, WatermarkParams};
 
 const PREVIEW_MAX_SIDE: u32 = 1280;
 const TEMPLATE_FILE: &str = "modifier-template.toml";
+const RENDER_DEBOUNCE: Duration = Duration::from_millis(150);
 
 pub(crate) struct ImageEditorUi {
     img_editor: ImageEditor,
     display_texture: Option<egui::TextureHandle>,
     dirty: bool,
+    dirty_since: Option<Instant>,
     zoom_percent: f32,
     source_path: Option<PathBuf>,
     render_sender: mpsc::Sender<RenderRequest>,
@@ -33,7 +36,19 @@ pub(crate) struct ImageEditorUi {
 #[derive(Clone, Serialize, Deserialize)]
 struct ModifierTemplate {
     name: String,
-    modifiers: Vec<TemplateEffect>,
+    modifiers: Vec<TemplateModifier>,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+struct TemplateModifier {
+    #[serde(default = "modifier_enabled_by_default")]
+    enabled: bool,
+    #[serde(flatten)]
+    effect: TemplateEffect,
+}
+
+fn modifier_enabled_by_default() -> bool {
+    true
 }
 
 #[derive(Serialize, Deserialize)]
@@ -112,11 +127,32 @@ enum TemplateEffect {
     Blur {
         sigma: f32,
     },
+    Sharpen {
+        sigma: f32,
+        threshold: i32,
+    },
     Brightness {
         value: i32,
     },
     Contrast {
         value: f32,
+    },
+    MagicColor {
+        whitening: f32,
+        color_boost: f32,
+    },
+    Binarize {
+        window_size: u32,
+        bias: i32,
+    },
+    Grayscale,
+    Lighten {
+        gamma: f32,
+        brightness: i32,
+    },
+    InkSaver {
+        threshold: u8,
+        thinning: u8,
     },
     Watermark {
         text: String,
@@ -219,6 +255,7 @@ impl ImageEditorUi {
             img_editor: ImageEditor::new(),
             display_texture: None,
             dirty: true,
+            dirty_since: None,
             zoom_percent: 100.0,
             source_path: None,
             render_sender,
@@ -258,36 +295,43 @@ impl ImageEditorUi {
                     modifiers: legacy
                         .modifiers
                         .into_iter()
-                        .map(|effect| match effect {
-                            LegacyTemplateEffect::Blur { sigma } => TemplateEffect::Blur { sigma },
-                            LegacyTemplateEffect::Brightness { value } => {
-                                TemplateEffect::Brightness { value }
-                            }
-                            LegacyTemplateEffect::Contrast { value } => {
-                                TemplateEffect::Contrast { value }
-                            }
-                            LegacyTemplateEffect::Watermark {
-                                text,
-                                color,
-                                x,
-                                y,
-                                scale,
-                                degree,
-                            } => {
-                                let [red, green, blue, alpha] =
-                                    egui::Color32::from_rgba_premultiplied(
-                                        color[0], color[1], color[2], color[3],
-                                    )
-                                    .to_srgba_unmultiplied();
-                                TemplateEffect::Watermark {
+                        .map(|effect| TemplateModifier {
+                            enabled: true,
+                            effect: match effect {
+                                LegacyTemplateEffect::Blur { sigma } => {
+                                    TemplateEffect::Blur { sigma }
+                                }
+                                LegacyTemplateEffect::Brightness { value } => {
+                                    TemplateEffect::Brightness { value }
+                                }
+                                LegacyTemplateEffect::Contrast { value } => {
+                                    TemplateEffect::Contrast { value }
+                                }
+                                LegacyTemplateEffect::Watermark {
                                     text,
-                                    color: format!("#{red:02X}{green:02X}{blue:02X}{alpha:02X}"),
+                                    color,
                                     x,
                                     y,
                                     scale,
                                     degree,
+                                } => {
+                                    let [red, green, blue, alpha] =
+                                        egui::Color32::from_rgba_premultiplied(
+                                            color[0], color[1], color[2], color[3],
+                                        )
+                                        .to_srgba_unmultiplied();
+                                    TemplateEffect::Watermark {
+                                        text,
+                                        color: format!(
+                                            "#{red:02X}{green:02X}{blue:02X}{alpha:02X}"
+                                        ),
+                                        x,
+                                        y,
+                                        scale,
+                                        degree,
+                                    }
                                 }
-                            }
+                            },
                         })
                         .collect(),
                 }],
@@ -315,23 +359,55 @@ impl ImageEditorUi {
                 .img_editor
                 .pipeline
                 .iter()
-                .map(|op| match &op.effect {
-                    EffectType::Blur { sigma } => TemplateEffect::Blur { sigma: *sigma },
-                    EffectType::Brightness { value } => {
-                        TemplateEffect::Brightness { value: *value }
-                    }
-                    EffectType::Contrast { value } => TemplateEffect::Contrast { value: *value },
-                    EffectType::Watermark { params } => {
-                        let [red, green, blue, alpha] = params.color.to_srgba_unmultiplied();
-                        TemplateEffect::Watermark {
-                            text: params.text.clone(),
-                            color: format!("#{red:02X}{green:02X}{blue:02X}{alpha:02X}"),
-                            x: params.x,
-                            y: params.y,
-                            scale: params.scale,
-                            degree: params.degree,
+                .map(|op| TemplateModifier {
+                    enabled: op.enabled,
+                    effect: match &op.effect {
+                        EffectType::Blur { sigma } => TemplateEffect::Blur { sigma: *sigma },
+                        EffectType::Sharpen { sigma, threshold } => TemplateEffect::Sharpen {
+                            sigma: *sigma,
+                            threshold: *threshold,
+                        },
+                        EffectType::Brightness { value } => {
+                            TemplateEffect::Brightness { value: *value }
                         }
-                    }
+                        EffectType::Contrast { value } => {
+                            TemplateEffect::Contrast { value: *value }
+                        }
+                        EffectType::MagicColor {
+                            whitening,
+                            color_boost,
+                        } => TemplateEffect::MagicColor {
+                            whitening: *whitening,
+                            color_boost: *color_boost,
+                        },
+                        EffectType::Binarize { window_size, bias } => TemplateEffect::Binarize {
+                            window_size: *window_size,
+                            bias: *bias,
+                        },
+                        EffectType::Grayscale => TemplateEffect::Grayscale,
+                        EffectType::Lighten { gamma, brightness } => TemplateEffect::Lighten {
+                            gamma: *gamma,
+                            brightness: *brightness,
+                        },
+                        EffectType::InkSaver {
+                            threshold,
+                            thinning,
+                        } => TemplateEffect::InkSaver {
+                            threshold: *threshold,
+                            thinning: *thinning,
+                        },
+                        EffectType::Watermark { params } => {
+                            let [red, green, blue, alpha] = params.color.to_srgba_unmultiplied();
+                            TemplateEffect::Watermark {
+                                text: params.text.clone(),
+                                color: format!("#{red:02X}{green:02X}{blue:02X}{alpha:02X}"),
+                                x: params.x,
+                                y: params.y,
+                                scale: params.scale,
+                                degree: params.degree,
+                            }
+                        }
+                    },
                 })
                 .collect(),
         };
@@ -366,37 +442,67 @@ impl ImageEditorUi {
         let effects = template
             .modifiers
             .into_iter()
-            .map(|effect| match effect {
-                TemplateEffect::Blur { sigma } => Ok(EffectType::Blur { sigma }),
-                TemplateEffect::Brightness { value } => Ok(EffectType::Brightness { value }),
-                TemplateEffect::Contrast { value } => Ok(EffectType::Contrast { value }),
-                TemplateEffect::Watermark {
-                    text,
-                    color,
-                    x,
-                    y,
-                    scale,
-                    degree,
-                } => Ok(EffectType::Watermark {
-                    params: WatermarkParams {
+            .map(|modifier| {
+                let effect = match modifier.effect {
+                    TemplateEffect::Blur { sigma } => EffectType::Blur { sigma },
+                    TemplateEffect::Sharpen { sigma, threshold } => {
+                        EffectType::Sharpen { sigma, threshold }
+                    }
+                    TemplateEffect::Brightness { value } => EffectType::Brightness { value },
+                    TemplateEffect::Contrast { value } => EffectType::Contrast { value },
+                    TemplateEffect::MagicColor {
+                        whitening,
+                        color_boost,
+                    } => EffectType::MagicColor {
+                        whitening,
+                        color_boost,
+                    },
+                    TemplateEffect::Binarize { window_size, bias } => {
+                        EffectType::Binarize { window_size, bias }
+                    }
+                    TemplateEffect::Grayscale => EffectType::Grayscale,
+                    TemplateEffect::Lighten { gamma, brightness } => {
+                        EffectType::Lighten { gamma, brightness }
+                    }
+                    TemplateEffect::InkSaver {
+                        threshold,
+                        thinning,
+                    } => EffectType::InkSaver {
+                        threshold,
+                        thinning,
+                    },
+                    TemplateEffect::Watermark {
                         text,
-                        color: parse_template_color(&color)?,
+                        color,
                         x,
                         y,
                         scale,
                         degree,
+                    } => EffectType::Watermark {
+                        params: WatermarkParams {
+                            text,
+                            color: parse_template_color(&color)?,
+                            x,
+                            y,
+                            scale,
+                            degree,
+                        },
                     },
-                }),
+                };
+                Ok((modifier.enabled, effect))
             })
             .collect::<Result<Vec<_>, String>>();
 
         match effects {
             Ok(effects) => {
                 self.img_editor.pipeline.clear();
-                for effect in effects {
+                for (enabled, effect) in effects {
                     self.img_editor.push_new_img_op(effect);
+                    if let Some(op) = self.img_editor.pipeline.last_mut() {
+                        op.enabled = enabled;
+                    }
                 }
-                self.dirty = true;
+                self.mark_dirty();
                 self.template_message = None;
             }
             Err(error) => self.template_message = Some(error),
@@ -425,6 +531,13 @@ impl ImageEditorUi {
             self.rendering = false;
         }
         self.dirty = false;
+        self.dirty_since = None;
+    }
+
+    fn mark_dirty(&mut self) {
+        self.dirty = true;
+        self.dirty_since = Some(Instant::now());
+        self.dirty_since = Some(Instant::now());
     }
 
     fn receive_rendered_image(&mut self, ctx: &egui::Context) {
@@ -478,7 +591,7 @@ impl eframe::App for ImageEditorUi {
                             .pick_file()
                         {
                             self.source_path = Some(path);
-                            self.dirty = true;
+                            self.mark_dirty();
                         }
                     }
 
@@ -543,9 +656,14 @@ impl eframe::App for ImageEditorUi {
             ui.horizontal(|ui| {
                 ui.heading("Modifier Stack");
                 ui.label(format!("({})", self.img_editor.pipeline.len()));
-                if !self.img_editor.pipeline.is_empty() && ui.small_button("Clear all").clicked() {
+                if !self.img_editor.pipeline.is_empty()
+                    && ui
+                        .small_button("Original")
+                        .on_hover_text("Clear all effects and show the unedited image")
+                        .clicked()
+                {
                     self.img_editor.pipeline.clear();
-                    self.dirty = true;
+                    self.mark_dirty();
                 }
             });
 
@@ -554,27 +672,73 @@ impl eframe::App for ImageEditorUi {
                 ui.label("No modifiers yet. Add an effect above.");
             }
 
-            ui.horizontal(|ui| {
+            ui.horizontal_wrapped(|ui| {
                 if ui.button("+ Blur").clicked() {
                     self.img_editor
                         .push_new_img_op(EffectType::Blur { sigma: 2.0 });
-                    self.dirty = true;
+                    self.mark_dirty();
+                }
+                if ui.button("+ Sharpen").clicked() {
+                    self.img_editor.push_new_img_op(EffectType::Sharpen {
+                        sigma: 1.0,
+                        threshold: 3,
+                    });
+                    self.mark_dirty();
                 }
                 if ui.button("+ Bright").clicked() {
                     self.img_editor
                         .push_new_img_op(EffectType::Brightness { value: 10 });
-                    self.dirty = true;
+                    self.mark_dirty();
                 }
                 if ui.button("+ Contrast").clicked() {
                     self.img_editor
                         .push_new_img_op(EffectType::Contrast { value: 1.2 });
-                    self.dirty = true;
+                    self.mark_dirty();
+                }
+                if ui.button("+ Magic Color").clicked() {
+                    self.img_editor.push_new_img_op(EffectType::MagicColor {
+                        whitening: 0.75,
+                        color_boost: 0.35,
+                    });
+                    self.mark_dirty();
+                }
+                if ui.button("+ B&W").clicked() {
+                    self.img_editor.push_new_img_op(EffectType::Binarize {
+                        window_size: 31,
+                        bias: 8,
+                    });
+                    self.mark_dirty();
+                }
+                if ui.button("+ B&W 2").clicked() {
+                    self.img_editor.push_new_img_op(EffectType::Binarize {
+                        window_size: 15,
+                        bias: 0,
+                    });
+                    self.mark_dirty();
+                }
+                if ui.button("+ Gray").clicked() {
+                    self.img_editor.push_new_img_op(EffectType::Grayscale);
+                    self.mark_dirty();
+                }
+                if ui.button("+ Lighten").clicked() {
+                    self.img_editor.push_new_img_op(EffectType::Lighten {
+                        gamma: 0.75,
+                        brightness: 8,
+                    });
+                    self.mark_dirty();
+                }
+                if ui.button("+ Ink Saver").clicked() {
+                    self.img_editor.push_new_img_op(EffectType::InkSaver {
+                        threshold: 220,
+                        thinning: 0,
+                    });
+                    self.mark_dirty();
                 }
                 if ui.button("+ Text").clicked() {
                     self.img_editor.push_new_img_op(EffectType::Watermark {
                         params: WatermarkParams::default(),
                     });
-                    self.dirty = true;
+                    self.mark_dirty();
                 }
             });
 
@@ -584,22 +748,46 @@ impl eframe::App for ImageEditorUi {
             let half_height = (self.img_editor.original_image.height() / 2) as i32;
 
             let mut remove_index: Option<usize> = None;
+            let mut modifier_changed = false;
 
             let response = dnd(ui, "effect_dnd").show_vec(
                 &mut self.img_editor.pipeline,
                 |ui, item, handle, state| {
                     ui.group(|ui| {
                         ui.horizontal(|ui| {
+                            let visibility_icon = if item.enabled { "👁" } else { "◌" };
+                            if ui
+                                .small_button(visibility_icon)
+                                .on_hover_text(if item.enabled {
+                                    "Disable this modifier"
+                                } else {
+                                    "Enable this modifier"
+                                })
+                                .clicked()
+                            {
+                                item.enabled = !item.enabled;
+                                modifier_changed = true;
+                            }
                             handle.ui(ui, |ui| {
                                 ui.label("::");
                             });
                             let title = match &item.effect {
                                 EffectType::Blur { .. } => "Blur",
+                                EffectType::Sharpen { .. } => "Sharpen",
                                 EffectType::Brightness { .. } => "Brightness",
                                 EffectType::Contrast { .. } => "Contrast",
+                                EffectType::MagicColor { .. } => "Magic Color",
+                                EffectType::Binarize { .. } => "B&W",
+                                EffectType::Grayscale => "Grayscale",
+                                EffectType::Lighten { .. } => "Lighten",
+                                EffectType::InkSaver { .. } => "Ink Saver",
                                 EffectType::Watermark { .. } => "Text watermark",
                             };
-                            ui.strong(title);
+                            if item.enabled {
+                                ui.strong(title);
+                            } else {
+                                ui.weak(title);
+                            }
                             if ui.small_button("Remove").clicked() {
                                 remove_index = Some(state.index);
                             }
@@ -608,17 +796,112 @@ impl eframe::App for ImageEditorUi {
                         match &mut item.effect {
                             EffectType::Blur { sigma } => {
                                 if ui.add(egui::Slider::new(sigma, 0.0..=10.0)).changed() {
-                                    self.dirty = true;
+                                    modifier_changed = true;
+                                }
+                            }
+                            EffectType::Sharpen { sigma, threshold } => {
+                                if ui
+                                    .add(egui::Slider::new(sigma, 0.1..=15.0).text("Strength"))
+                                    .changed()
+                                {
+                                    modifier_changed = true;
+                                }
+                                if ui
+                                    .add(
+                                        egui::Slider::new(threshold, 0..=20)
+                                            .text("Noise threshold"),
+                                    )
+                                    .changed()
+                                {
+                                    modifier_changed = true;
                                 }
                             }
                             EffectType::Brightness { value } => {
                                 if ui.add(egui::Slider::new(value, -100..=100)).changed() {
-                                    self.dirty = true;
+                                    modifier_changed = true;
                                 }
                             }
                             EffectType::Contrast { value } => {
-                                if ui.add(egui::Slider::new(value, 0.0..=5.0)).changed() {
-                                    self.dirty = true;
+                                if ui.add(egui::Slider::new(value, 0.0..=15.0)).changed() {
+                                    modifier_changed = true;
+                                }
+                            }
+                            EffectType::MagicColor {
+                                whitening,
+                                color_boost,
+                            } => {
+                                if ui
+                                    .add(
+                                        egui::Slider::new(whitening, 0.0..=1.0)
+                                            .text("Paper whitening"),
+                                    )
+                                    .changed()
+                                {
+                                    modifier_changed = true;
+                                }
+                                if ui
+                                    .add(
+                                        egui::Slider::new(color_boost, 0.0..=2.0)
+                                            .text("Color boost"),
+                                    )
+                                    .changed()
+                                {
+                                    modifier_changed = true;
+                                }
+                            }
+                            EffectType::Binarize { window_size, bias } => {
+                                if ui
+                                    .add(
+                                        egui::Slider::new(window_size, 3..=61)
+                                            .step_by(2.0)
+                                            .text("Adaptive window"),
+                                    )
+                                    .changed()
+                                {
+                                    modifier_changed = true;
+                                }
+                                if ui
+                                    .add(egui::Slider::new(bias, 0..=40).text("Ink strength"))
+                                    .changed()
+                                {
+                                    modifier_changed = true;
+                                }
+                            }
+                            EffectType::Grayscale => {
+                                ui.label("Neutral grayscale conversion");
+                            }
+                            EffectType::Lighten { gamma, brightness } => {
+                                if ui
+                                    .add(egui::Slider::new(gamma, 0.2..=1.0).text("Gamma"))
+                                    .changed()
+                                {
+                                    modifier_changed = true;
+                                }
+                                if ui
+                                    .add(egui::Slider::new(brightness, -32..=64).text("Brightness"))
+                                    .changed()
+                                {
+                                    modifier_changed = true;
+                                }
+                            }
+                            EffectType::InkSaver {
+                                threshold,
+                                thinning,
+                            } => {
+                                if ui
+                                    .add(
+                                        egui::Slider::new(threshold, 160..=250)
+                                            .text("White threshold"),
+                                    )
+                                    .changed()
+                                {
+                                    modifier_changed = true;
+                                }
+                                if ui
+                                    .add(egui::Slider::new(thinning, 0..=2).text("Thin heavy ink"))
+                                    .changed()
+                                {
+                                    modifier_changed = true;
                                 }
                             }
                             EffectType::Watermark { params } => {
@@ -626,14 +909,14 @@ impl eframe::App for ImageEditorUi {
                                     ui.horizontal(|ui| {
                                         ui.label("Color");
                                         if ui.color_edit_button_srgba(&mut params.color).changed() {
-                                            self.dirty = true;
+                                            modifier_changed = true;
                                         }
                                         ui.label("Scale");
                                         if ui
                                             .add(egui::Slider::new(&mut params.scale, 1.0..=100.0))
                                             .changed()
                                         {
-                                            self.dirty = true;
+                                            modifier_changed = true;
                                         }
                                     });
                                     ui.horizontal(|ui| {
@@ -642,7 +925,7 @@ impl eframe::App for ImageEditorUi {
                                             .add(egui::TextEdit::multiline(&mut params.text))
                                             .changed()
                                         {
-                                            self.dirty = true;
+                                            modifier_changed = true;
                                         }
                                     });
                                     ui.horizontal(|ui| {
@@ -654,7 +937,7 @@ impl eframe::App for ImageEditorUi {
                                             ))
                                             .changed()
                                         {
-                                            self.dirty = true;
+                                            modifier_changed = true;
                                         }
                                     });
                                     ui.horizontal(|ui| {
@@ -666,7 +949,7 @@ impl eframe::App for ImageEditorUi {
                                             ))
                                             .changed()
                                         {
-                                            self.dirty = true;
+                                            modifier_changed = true;
                                         }
                                     });
                                     ui.horizontal(|ui| {
@@ -678,7 +961,7 @@ impl eframe::App for ImageEditorUi {
                                             ))
                                             .changed()
                                         {
-                                            self.dirty = true;
+                                            modifier_changed = true;
                                         }
                                     });
                                 });
@@ -688,19 +971,31 @@ impl eframe::App for ImageEditorUi {
                 },
             );
 
+            if modifier_changed {
+                self.mark_dirty();
+            }
             if let Some(idx) = remove_index {
                 self.img_editor.pipeline.remove(idx);
-                self.dirty = true;
+                self.mark_dirty();
             }
 
             if response.final_update().is_some() {
-                self.dirty = true;
+                self.mark_dirty();
             }
         });
 
         egui::CentralPanel::default().show(ctx, |ui| {
             if self.dirty {
-                self.request_render(ctx);
+                if let Some(changed_at) = self.dirty_since {
+                    let remaining = RENDER_DEBOUNCE.saturating_sub(changed_at.elapsed());
+                    if remaining.is_zero() {
+                        self.request_render(ctx);
+                    } else {
+                        ctx.request_repaint_after(remaining);
+                    }
+                } else {
+                    self.request_render(ctx);
+                }
             }
             ui.horizontal(|ui| {
                 if ui.button("-").clicked() {
@@ -736,15 +1031,14 @@ impl eframe::App for ImageEditorUi {
                 let display_width = fit_width * self.zoom_percent / 100.0;
                 let aspect_ratio = texture.size_vec2().y / texture.size_vec2().x;
                 let display_size = egui::vec2(display_width, display_width * aspect_ratio);
-                let watermark =
-                    self.img_editor
-                        .pipeline
-                        .iter()
-                        .rev()
-                        .find_map(|op| match &op.effect {
-                            EffectType::Watermark { params } => Some((op.id, params.x, params.y)),
-                            _ => None,
-                        });
+                let watermark = self.img_editor.pipeline.iter().rev().find_map(|op| {
+                    match (&op.effect, op.enabled) {
+                        (EffectType::Watermark { params }, true) => {
+                            Some((op.id, params.x, params.y))
+                        }
+                        _ => None,
+                    }
+                });
                 let mut drag_delta = None;
 
                 egui::ScrollArea::both().show(ui, |ui| {
@@ -800,11 +1094,53 @@ impl eframe::App for ImageEditorUi {
                             let max_y = (self.img_editor.original_image.height() / 2) as i32;
                             params.x = (params.x + delta.x.round() as i32).clamp(-max_x, max_x);
                             params.y = (params.y + delta.y.round() as i32).clamp(-max_y, max_y);
-                            self.dirty = true;
+                            self.mark_dirty();
                         }
                     }
                 }
             }
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn template_modifiers_round_trip_enabled_state_and_default_legacy_state() {
+        let catalog = TemplateCatalog {
+            version: template_format_version(),
+            templates: vec![ModifierTemplate {
+                name: "Document".to_string(),
+                modifiers: vec![
+                    TemplateModifier {
+                        enabled: false,
+                        effect: TemplateEffect::Binarize {
+                            window_size: 31,
+                            bias: 8,
+                        },
+                    },
+                    TemplateModifier {
+                        enabled: true,
+                        effect: TemplateEffect::Grayscale,
+                    },
+                ],
+            }],
+        };
+        let serialized = toml::to_string_pretty(&catalog).unwrap();
+        let decoded: TemplateCatalog = toml::from_str(&serialized).unwrap();
+        assert!(!decoded.templates[0].modifiers[0].enabled);
+        assert!(decoded.templates[0].modifiers[1].enabled);
+
+        let old_template = r#"
+[[templates]]
+name = "Older"
+
+[[templates.modifiers]]
+type = "grayscale"
+"#;
+        let decoded: TemplateCatalog = toml::from_str(old_template).unwrap();
+        assert!(decoded.templates[0].modifiers[0].enabled);
     }
 }

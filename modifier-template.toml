@@ -4,14 +4,17 @@ version = 1
 name = "Test"
 
 [[templates.modifiers]]
+enabled = true
 type = "contrast"
 value = 0.10000000149011612
 
 [[templates.modifiers]]
+enabled = true
 type = "brightness"
 value = 35
 
 [[templates.modifiers]]
+enabled = true
 type = "watermark"
 text = """
 My Watermark
@@ -21,3 +24,17 @@ x = -182
 y = -197
 scale = 24.0
 degree = -45.0
+
+[[templates]]
+name = "a"
+
+[[templates.modifiers]]
+enabled = false
+type = "sharpen"
+sigma = 14.0
+threshold = 0
+
+[[templates.modifiers]]
+enabled = true
+type = "contrast"
+value = 5.0
