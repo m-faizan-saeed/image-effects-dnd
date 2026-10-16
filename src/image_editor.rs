@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use eframe::egui::Color32;
 use image::DynamicImage;
 
@@ -55,7 +57,7 @@ impl std::hash::Hash for ImageOp {
 pub(crate) struct ImageEditor {
     pub(crate) pipeline: Vec<ImageOp>,
     pub(crate) next_id: usize,
-    pub(crate) original_image: DynamicImage,
+    pub(crate) original_image: Arc<DynamicImage>,
     pub(crate) final_image: Option<DynamicImage>,
 }
 
@@ -84,34 +86,35 @@ impl ImageEditor {
         Self {
             pipeline: vec![],
             next_id: 0,
-            original_image: dynamic_img,
+            original_image: Arc::new(dynamic_img),
             final_image: None,
         }
     }
 
-    pub(crate) fn process_image(&mut self) {
-        let mut img = self.original_image.clone();
+    pub(crate) fn save_image(&self, path: &str) {
+        if let Some(img) = &self.final_image {
+            img.save(path);
+        }
+    }
 
-        for op in &self.pipeline {
+    pub(crate) fn render_image(original: &DynamicImage, pipeline: &[ImageOp]) -> DynamicImage {
+        let mut img = original.clone();
+        println!("Pipeline Start");
+
+        for op in pipeline {
             match &op.effect {
-                EffectType::Blur { sigma } => {
-                    // Check for 0.0 to prevent crash on some blur implementations
-                    if *sigma > 0.0 {
-                        img = img.blur(*sigma);
-                    }
-                }
-                EffectType::Brightness { value } => {
-                    img = img.brighten(*value);
-                }
-                EffectType::Contrast { value } => {
-                    img = img.adjust_contrast(*value);
-                }
+                EffectType::Blur { sigma } if *sigma > 0.0 => img = img.blur(*sigma),
+                EffectType::Brightness { value } => img = img.brighten(*value),
+                EffectType::Contrast { value } => img = img.adjust_contrast(*value),
                 EffectType::Watermark { params } => {
                     let _ = draw_watermark(&mut img, params);
                 }
+                EffectType::Blur { .. } => {}
             }
         }
 
-        self.final_image = Some(img);
+        println!("Pipeline End");
+
+        img
     }
 }
